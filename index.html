@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>تقرير البلاغات</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+<style>
+body{font-family:Arial;padding:15px;background:#f5f5f5;margin:0}
+.controls{background:#fff;padding:10px;margin:10px}
+input,button{padding:6px;margin:4px}
+button{background:#3498db;color:#fff;border:none;cursor:pointer}
+.statusBox{background:#fff;padding:10px;margin:10px;border-radius:6px}
+select{width:100%;height:120px}
+.rangeBox{background:#16a085;color:#fff;padding:10px;margin:10px;border-radius:8px;display:inline-block}
+table{border-collapse:collapse;width:100%;background:#fff}
+th,td{border:1px solid #000;padding:6px;text-align:center}
+thead tr.header{background:#dfe6e9}
+.late{color:red;font-weight:bold}
+.page-break{page-break-before:always}
+
+@media print{
+  body *{visibility:hidden}
+  #printArea, #printArea *{visibility:visible}
+  #printArea{
+    position:absolute;
+    top:0;right:0;left:0;
+    width:100%;
+    transform:scale(0.95);
+    transform-origin:top right;
+  }
+  thead{display:table-header-group}
+}
+</style>
+</head>
+
+<body>
+
+<div class="controls">
+
+<input type="text" id="searchBox" placeholder="بحث رقم البلاغ" oninput="applyFilters()">
+
+<br>
+
+من:
+<input type="datetime-local" id="fromDate" onchange="applyFilters()">
+
+إلى:
+<input type="datetime-local" id="toDate" onchange="applyFilters()">
+
+<br>
+
+<button onclick="setTimeFilter(24)">أقل من 24 ساعة</button>
+<button onclick="setTimeFilter(48)">أقل من 48 ساعة</button>
+<button onclick="setTimeFilter(168)">أقل من أسبوع</button>
+<button onclick="setTimeFilter(336)">أقل من أسبوعين</button>
+<button onclick="setTimeFilter(null)">الكل</button>
+
+<button onclick="toggleLate()">المتأخر فقط</button>
+
+<br>
+
+<button onclick="resetFilter()">إعادة</button>
+<select id="munSelect" style="width:auto;height:auto;padding:6px;margin:4px">
+  <option value="__ALL__">كل البلديات (ملف لكل بلدية)</option>
+</select>
+<button onclick="startPrint()">🖨️ طباعة</button>
+<button onclick="startPrint('closure')" style="background:#8e44ad">🖨️ طباعة بانتظار التحقق من إجراء الإغلاق</button>
+<button onclick="startPrint('cars')" style="background:#d35400">🖨️ طباعة السيارات التالفة</button>
+
+<input type="file" id="fileInput">
+
+<br>
+<span id="storageInfo" style="font-size:13px;color:#555"></span>
+<button onclick="clearSaved()" style="background:#c0392b">مسح بيانات الجدول</button>
+<button onclick="exportLateExcel()" style="background:#27ae60">📊 تصدير إكسل المتأخرة بعد التنبيه</button>
+
+</div>
+
+<div class="statusBox">
+
+<select id="statusMulti" multiple onchange="applyFilters()"></select>
+
+<br>
+
+<label>
+<input type="checkbox" id="selectAll" checked onclick="toggleSelectAll()">
+اختيار الكل
+</label>
+
+</div>
+
+<div class="rangeBox">
+نطاق النتائج: <span id="rangeBox">-</span>
+</div>
+
+<div id="printArea"></div>
+
+<script>
+
+let dataAll = [];
+let timeFilter = null;
+let lateOnly = false;
+
+const DEFAULT_STANDARD = 120;
+
+document.getElementById("fileInput").addEventListener("change", function(e){
+  const file = e.target.files[0];
+  if(!file) return;
+
+  const reader = new FileReader();
+
+  reader.onload = function(e){
+    const workbook = XLSX.read(new Uint8Array(e.target.result), {type:'array'});
+    dataAll = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
+    saveData(file.name);
+    buildStatusMulti();
+    buildMunSelect();
+    render();
+  };
+
+  reader.readAsArrayBuffer(file);
+});
+
+/* ===== التخزين: بيانات آخر ملف + سجل التنويهات ===== */
+const KEY_DATA = "balaghat_data";
+const KEY_NOTICES = "balaghat_notices";
+const KEY_NOTICES48 = "balaghat_notices48";
+let notices48 = {};    // رقم البلاغ -> وقت الطباعة (ms) عندما كان باقي عليه أقل من 48 ساعة
+let notices = {};      // رقم البلاغ -> وقت الطباعة (ms) عندما كان باقي عليه أقل من 24 ساعة
+const KEY_LATE = "balaghat_late_log";
+let lateLog = {};      // سجل دائم: البلاغات التي تم التنبيه عليها ثم دخلت حيز التأخير (لا يُمسح)
+let printMun = null;   // البلدية الجاري طباعتها
+let printQueue = [];
+let specialMode = null;  // null = عادي | "closure" = بانتظار التحقق من إجراء الإغلاق | "cars" = السيارات التالفة
+
+function norm(t){
+  return (t + "").replace(/[أإآ]/g,"ا").replace(/ة/g,"ه").replace(/\s+/g," ").trim();
+}
+function isCars(r){
+  let v = r["التصنيف التخصصي"];
+  if(v === undefined){
+    for(const k in r){ if(norm(k).includes(norm("التصنيف التخصصي"))){ v = r[k]; break; } }
+  }
+  return v !== undefined && norm(v).includes(norm("السيارات التالفة"));
+}
+function isClosure(status){
+  return norm(status).includes(norm("بانتظار التحقق من إجراء الإغلاق"));
+}
+let lastShown = [];   // الصفوف الظاهرة في آخر عرض
+let originalTitle = document.title;
+
+function storageOK(){
+  try{ localStorage.setItem("__t","1"); localStorage.removeItem("__t"); return true; }catch(err){ return false; }
+}
+
+/* يحفظ فقط البلاغات التي باقي عليها أقل من 24 ساعة (أو سبق التنويه عليها) وبالأعمدة الضرورية فقط */
+function saveData(fileName){
+  if(!storageOK()){
+    alert("المتصفح لا يسمح بالحفظ عند فتح الصفحة بهذه الطريقة. افتح الصفحة من رابط (https) أو من متصفح Chrome مباشرة ليعمل الحفظ والتنويه.");
+    updateStorageInfo();
+    return;
+  }
+  const rows = [];
+  dataAll.forEach(r=>{
+    const num = (r["رقم البلاغ"] || "") + "";
+    if(!num) return;
+    const rem = getRemainingHours(r);
+    if((rem !== null && rem > 0 && rem < 48) || notices[num] || notices48[num]){
+      rows.push({
+        "رقم البلاغ": num,
+        "تاريخ الإنشاء": getDate(r),
+        "حالة البلاغ": r["حالة البلاغ في النظام"] || r["حالة البلاغ"] || "",
+        "البلدية": getMun(r)
+      });
+    }
+  });
+  try{
+    localStorage.setItem(KEY_DATA, JSON.stringify({fileName, savedAt: Date.now(), rows}));
+  }catch(err){
+    alert("تعذر حفظ البيانات في المتصفح.");
+  }
+  updateStorageInfo();
+}
+
+function saveNotices(){
+  try{ localStorage.setItem(KEY_NOTICES, JSON.stringify(notices)); }catch(err){}
+  try{ localStorage.setItem(KEY_NOTICES48, JSON.stringify(notices48)); }catch(err){}
+}
+
+function loadSaved(){
+  try{ notices = JSON.parse(localStorage.getItem(KEY_NOTICES) || "{}") || {}; }catch(err){ notices = {}; }
+  try{ notices48 = JSON.parse(localStorage.getItem(KEY_NOTICES48) || "{}") || {}; }catch(err){ notices48 = {}; }
+  try{ lateLog = JSON.parse(localStorage.getItem(KEY_LATE) || "{}") || {}; }catch(err){ lateLog = {}; }
+  updateStorageInfo();
+}
+
+function updateStorageInfo(){
+  let txt = "";
+  try{
+    const d = JSON.parse(localStorage.getItem(KEY_DATA) || "null");
+    if(d) txt = "المحفوظ من " + d.fileName + ": " + (d.rows||[]).length + " بلاغ باقي عليه أقل من 48 ساعة" + " — حُفظ في " + fmtDate(new Date(d.savedAt)) + " الساعة " + fmtTime(new Date(d.savedAt));
+  }catch(err){}
+  const n = new Set([...Object.keys(notices), ...Object.keys(notices48)]).size;
+  if(n) txt += (txt ? " | " : "") + "بلاغات تم التنويه عليها: " + n;
+  const L = Object.keys(lateLog).length;
+  if(L) txt += (txt ? " | " : "") + "تأخرت بعد التنبيه: " + L;
+  document.getElementById("storageInfo").innerText = txt || "لا توجد بيانات محفوظة";
+}
+
+function clearSaved(){
+  if(!confirm("سيتم مسح بيانات الجدول فقط. سجل التنبيهات والبلاغات المتأخرة يبقى محفوظاً. متأكد؟")) return;
+  try{ localStorage.removeItem(KEY_DATA); }catch(err){}
+  dataAll = [];
+  buildStatusMulti();
+  buildMunSelect();
+  updateStorageInfo();
+  render();
+}
+
+function fmtDate(d){
+  return d.getFullYear() + "/" + String(d.getMonth()+1).padStart(2,"0") + "/" + String(d.getDate()).padStart(2,"0");
+}
+function fmtTime(d){
+  let h = d.getHours(), m = String(d.getMinutes()).padStart(2,"0");
+  let p = h >= 12 ? "م" : "ص";
+  h = h % 12 || 12;
+  return h + ":" + m + " " + p;
+}
+
+/* ===== البلدية ===== */
+function getMun(r){
+  const keys = ["البلدية الفرعية","البلديه الفرعيه","البلدية الفرعيه","البلديه الفرعية"];
+  for(const k of keys){
+    if(r[k] !== undefined) return (r[k] + "").trim() || "بدون بلدية";
+  }
+  for(const k in r){
+    const kk = k.trim();
+    if((kk.includes("بلدية") || kk.includes("بلديه")) && (kk.includes("الفرعية") || kk.includes("الفرعيه")))
+      return (r[k] + "").trim() || "بدون بلدية";
+  }
+  if(r["البلدية"] !== undefined) return (r["البلدية"] + "").trim() || "بدون بلدية";
+  return "بدون بلدية";
+}
+
+function getMunList(){
+  const set = new Set();
+  dataAll.forEach(r => set.add(getMun(r)));
+  return [...set];
+}
+
+function buildMunSelect(){
+  const sel = document.getElementById("munSelect");
+  sel.innerHTML = '<option value="__ALL__">كل البلديات (ملف لكل بلدية)</option>';
+  getMunList().forEach(m=>{
+    const o = document.createElement("option");
+    o.value = m; o.textContent = m;
+    sel.appendChild(o);
+  });
+}
+
+/* ===== الطباعة: كل بلدية في ملف لحالها ===== */
+function startPrint(mode){
+  specialMode = mode || null;
+  if(!dataAll.length){ window.print(); specialMode = null; return; }
+  const v = document.getElementById("munSelect").value;
+  printQueue = v === "__ALL__" ? (specialMode ? ["__ALL__"] : getMunList()) : [v];   // الأزرار الخاصة: ملف واحد لكل البلديات
+  printNext();
+}
+
+function printNext(){
+  if(!printQueue.length){
+    printMun = null;
+    specialMode = null;
+    document.title = originalTitle;
+    render();
+    return;
+  }
+  printMun = printQueue.shift();
+  {
+    const d = new Date();
+    const t = fmtTime(d).replace(":", "."); // النقطتان غير مسموحة في اسم الملف
+    document.title = (specialMode === "closure" ? "بانتظار التحقق من إجراء الإغلاق - " : specialMode === "cars" ? "السيارات التالفة - " : "بلاغات ")
+      + (printMun === "__ALL__" ? "كل البلديات" : printMun)
+      + " - طباعة " + fmtDate(d).replace(/\//g, "-") + " الساعة " + t;   // عنوان واسم ملف الـPDF
+  }
+  render();
+  if(!document.getElementById("printArea").innerHTML.trim()){ printNext(); return; } // بلدية بدون نتائج
+  recordNotices();
+  setTimeout(()=>window.print(), 300);
+}
+
+window.addEventListener("afterprint", ()=>{
+  if(printMun !== null) setTimeout(printNext, 300);
+});
+
+/* يسجل وقت الطباعة للبلاغات التي باقي عليها أقل من 24 ساعة */
+function recordNotices(){
+  const now = Date.now();
+  lastShown.forEach(r=>{
+    const num = (r["رقم البلاغ"] || "") + "";
+    if(!num) return;
+    const rem = getRemainingHours(r);
+    if(rem !== null && rem > 0 && rem < 24 && !notices[num]) notices[num] = now;
+    if(rem !== null && rem > 0 && rem < 48 && !notices48[num]) notices48[num] = now;
+  });
+  saveNotices();
+  updateStorageInfo();
+}
+
+function getNoticeText(r){
+  const num = (r["رقم البلاغ"] || "") + "";
+  const rem = getRemainingHours(r);
+  if(!num || (!notices[num] && !notices48[num]) || rem === null || rem >= 0) return "";
+  const parts = [];
+  if(notices48[num]){ const d = new Date(notices48[num]); parts.push("تم التنويه عليه (48 ساعة) في " + fmtDate(d) + " الساعة " + fmtTime(d)); }
+  if(notices[num]){ const d = new Date(notices[num]); parts.push("تم التنويه عليه (24 ساعة) في " + fmtDate(d) + " الساعة " + fmtTime(d)); }
+  return parts.join("<br>");
+}
+
+function getDate(r){
+  return r["تاريخ الإنشاء"] || r["تاريخ الأنشاء"] || "";
+}
+
+function parseDateSafe(val){
+  if(!val) return null;
+  const d = new Date(val);
+  if(isNaN(d.getTime())) return null;
+  return d;
+}
+
+/* 🔥 كل التعديلات هنا */
+function getStandardHours(r){
+
+  let الحالة = r["حالة البلاغ في النظام"] || r["حالة البلاغ"] || "";
+
+  if(
+    الحالة.includes("تأكيد المعالجة") ||
+    الحالة.includes("تاكيد المعالجة") ||
+    الحالة.includes("PendingConfirmation") ||
+    الحالة.includes("Contractor") ||
+    الحالة.includes("سحب المركبة") ||
+    الحالة.includes("سحب المركبه") ||
+    الحالة.includes("تأكيد المقاول") ||
+    الحالة.includes("تاكيد المقاول") ||
+    الحالة.includes("تسليم المركبة") ||
+    الحالة.includes("تسليم المركبه") ||
+    الحالة.includes("تسليم السيارة") ||
+    الحالة.includes("تسليم السياره") ||
+    الحالة.includes("انتظار- تسليم السيارة") ||
+    الحالة.includes("انتظار- تسليم السياره") ||
+    الحالة.includes("انتظار - تسليم السيارة") ||
+    الحالة.includes("انتظار - تسليم السياره")
+  ){
+    return 120 * 24;
+  }
+
+  if(الحالة.includes("تصحيح")){
+    return 107 * 24;
+  }
+
+  const val =
+    r["الزمن المعياري"] ??
+    r["الوقت المعياري"] ??
+    r["الوقت المعياري للمعالجة"] ??
+    r["SLA"] ??
+    DEFAULT_STANDARD;
+
+  const num = parseFloat(val);
+  return isNaN(num) ? DEFAULT_STANDARD : num;
+}
+
+function getMaxDate(r){
+  const start = parseDateSafe(getDate(r));
+  if(!start) return "";
+  const end = new Date(start.getTime() + (getStandardHours(r) * 3600000));
+  return end.toLocaleString('ar-SA');
+}
+
+function getRemainingHours(r){
+  const start = parseDateSafe(getDate(r));
+  if(!start) return null;
+
+  const end = new Date(start.getTime() + (getStandardHours(r) * 3600000));
+  return (end - new Date()) / 3600000;
+}
+
+function formatTime(hours){
+  if(hours === null) return "";
+
+  let abs = Math.abs(hours);
+
+  let days = Math.floor(abs / 24);
+  let hrs = Math.floor(abs % 24);
+  let mins = Math.floor((abs * 60) % 60);
+
+  let txt = `${days} يوم ${hrs} ساعة ${mins} دقيقة`;
+
+  return hours < 0 ? "متأخر " + txt : "متبقي " + txt;
+}
+
+function buildStatusMulti(){
+  let sel = document.getElementById("statusMulti");
+  sel.innerHTML = "";
+
+  let set = new Set();
+
+  dataAll.forEach(r=>{
+    let s = r["حالة البلاغ في النظام"] || r["حالة البلاغ"] || "";
+    if(s && !isClosure(s)) set.add(s);
+  });
+
+  set.forEach(s=>{
+    let opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    opt.selected = true;
+    sel.appendChild(opt);
+  });
+}
+
+function getSelectedStatus(){
+  let sel = document.getElementById("statusMulti");
+  let arr = [];
+
+  for(let i=0; i<sel.options.length; i++){
+    if(sel.options[i].selected){
+      arr.push(sel.options[i].value);
+    }
+  }
+
+  return arr;
+}
+
+function toggleSelectAll(){
+  let check = document.getElementById("selectAll").checked;
+  let sel = document.getElementById("statusMulti");
+
+  for(let i=0; i<sel.options.length; i++){
+    sel.options[i].selected = check;
+  }
+
+  applyFilters();
+}
+
+function toggleLate(){
+  lateOnly = !lateOnly;
+  render();
+}
+
+function setTimeFilter(v){
+  timeFilter = v;
+  render();
+}
+
+function applyFilters(){
+  render();
+}
+
+function resetFilter(){
+  document.getElementById("searchBox").value = "";
+  document.getElementById("fromDate").value = "";
+  document.getElementById("toDate").value = "";
+  timeFilter = null;
+  lateOnly = false;
+  document.getElementById("selectAll").checked = true;
+  document.querySelectorAll("#statusMulti option").forEach(o=>o.selected = true);
+  render();
+}
+
+/* يسجل بشكل دائم أي بلاغ تم التنبيه عليه ثم دخل حيز التأخير */
+function updateLateLog(){
+  let changed = false;
+  dataAll.forEach(r=>{
+    const num = (r["رقم البلاغ"] || "") + "";
+    if(!num || (!notices[num] && !notices48[num])) return;
+    const rem = getRemainingHours(r);
+    if(rem === null || rem >= 0) return;
+    if(lateLog[num]){
+      // تحديث أوقات التنبيه إن كانت ناقصة
+      if(notices[num] && !lateLog[num].noticeAt){ lateLog[num].noticeAt = notices[num]; changed = true; }
+      if(notices48[num] && !lateLog[num].notice48At){ lateLog[num].notice48At = notices48[num]; changed = true; }
+      return;
+    }
+    {
+      lateLog[num] = {
+        num,
+        emp: r["اسم الموظف المسند اليه"] || r["اسم الموظف المسند إليه"] || r["اسم الموظف"] || "بدون اسم",
+        mun: getMun(r),
+        noticeAt: notices[num] || null,
+        notice48At: notices48[num] || null,
+        lateAt: Date.now()
+      };
+      changed = true;
+    }
+  });
+  if(changed){
+    try{ localStorage.setItem(KEY_LATE, JSON.stringify(lateLog)); }catch(err){}
+    updateStorageInfo();
+  }
+}
+
+/* تصدير إكسل: تفاصيل البلاغات + ملخص لكل موظف */
+function exportLateExcel(){
+  updateLateLog();
+  const first = x => x.notice48At || x.noticeAt;
+  const list = Object.values(lateLog).sort((a,b)=>first(a)-first(b));
+  if(!list.length){ alert("لا توجد بلاغات تم التنبيه عليها ودخلت حيز التأخير."); return; }
+
+  const dt = t => t ? fmtDate(new Date(t)) : "";
+  const tm = t => t ? fmtTime(new Date(t)) : "";
+  const details = list.map(x=>({
+    "اسم الموظف": x.emp,
+    "رقم البلاغ": x.num,
+    "البلدية الفرعية": x.mun,
+    "تاريخ تنبيه 48 ساعة": dt(x.notice48At),
+    "وقت تنبيه 48 ساعة": tm(x.notice48At),
+    "تاريخ تنبيه 24 ساعة": dt(x.noticeAt),
+    "وقت تنبيه 24 ساعة": tm(x.noticeAt)
+  }));
+
+  const c = {};
+  list.forEach(x=>{
+    c[x.emp] = c[x.emp] || {all:0, h48:0, h24:0};
+    c[x.emp].all++;
+    if(x.notice48At) c[x.emp].h48++;
+    if(x.noticeAt) c[x.emp].h24++;
+  });
+  const summary = Object.keys(c).sort((a,b)=>c[b].all-c[a].all).map(e=>({
+    "اسم الموظف": e,
+    "عدد البلاغات التي تم التنبيه عليها ودخلت حيز التأخير": c[e].all,
+    "منها تنبيه 48 ساعة": c[e].h48,
+    "منها تنبيه 24 ساعة": c[e].h24
+  }));
+
+  const wb = XLSX.utils.book_new();
+  wb.Workbook = {Views:[{RTL:true}]};
+  const ws1 = XLSX.utils.json_to_sheet(summary);
+  ws1["!cols"] = [{wch:30},{wch:45},{wch:20},{wch:20}];
+  const ws2 = XLSX.utils.json_to_sheet(details);
+  ws2["!cols"] = [{wch:30},{wch:18},{wch:22},{wch:18},{wch:16},{wch:18},{wch:16}];
+  XLSX.utils.book_append_sheet(wb, ws1, "ملخص الموظفين");
+  XLSX.utils.book_append_sheet(wb, ws2, "تفاصيل البلاغات");
+
+  const d = new Date();
+  XLSX.writeFile(wb, "المتأخرة بعد التنبيه " + fmtDate(d).replace(/\//g,"-") + ".xlsx");
+}
+
+function render(){
+
+  updateLateLog();
+
+  let selectedStatus = getSelectedStatus();
+  let search = document.getElementById("searchBox").value.toLowerCase();
+  let from = document.getElementById("fromDate").value;
+  let to = document.getElementById("toDate").value;
+
+  let groups = {};
+  let datesList = [];
+  lastShown = [];
+
+  dataAll.forEach(r=>{
+
+    let رقم = (r["رقم البلاغ"] || "") + "";
+    let تاريخ = parseDateSafe(getDate(r));
+    let حالة = r["حالة البلاغ في النظام"] || r["حالة البلاغ"] || "";
+    let rem = getRemainingHours(r);
+
+    let show = true;
+
+    if(search && !رقم.toLowerCase().includes(search)) show = false;
+    if(specialMode === "cars"){
+      if(!isCars(r)) show = false;
+    }else if(specialMode === "closure"){
+      if(!isClosure(حالة) || isCars(r)) show = false;
+    }else{
+      if(isClosure(حالة) || isCars(r)) show = false;   // لها أزرار طباعة خاصة
+      if(selectedStatus.length && !selectedStatus.includes(حالة)) show = false;
+    }
+
+    if(from && تاريخ && تاريخ < new Date(from)) show = false;
+    if(to && تاريخ && تاريخ > new Date(to)) show = false;
+
+    if(timeFilter !== null){
+      if(rem === null || rem <= 0 || rem > timeFilter){
+        show = false;
+      }
+    }
+
+    if(lateOnly && !(rem !== null && rem < 0)) show = false;
+
+    if(printMun !== null && printMun !== "__ALL__" && getMun(r) !== printMun) show = false;
+
+    if(!show) return;
+
+    lastShown.push(r);
+
+    if(تاريخ) datesList.push(تاريخ);
+
+    if(!groups[حالة]) groups[حالة] = [];
+    groups[حالة].push(r);
+
+  });
+
+  if(datesList.length){
+    datesList.sort((a,b)=>a-b);
+    let min = datesList[0];
+    let max = datesList[datesList.length - 1];
+    let format = d => d.toLocaleString('ar-SA');
+
+    document.getElementById("rangeBox").innerText =
+      format(min) + " ⬅ إلى ⬅ " + format(max);
+  }else{
+    document.getElementById("rangeBox").innerText = "-";
+  }
+
+  let container = document.getElementById("printArea");
+  container.innerHTML = "";
+
+  let first = true;
+
+  for(let حالة in groups){
+
+    let div = document.createElement("div");
+    if(!first) div.className = "page-break";
+    first = false;
+
+    let showMunCol = printMun === "__ALL__";
+    let hasNotice = groups[حالة].some(r => getNoticeText(r));
+
+    let html = `
+      <h2>الحالة: ${حالة}</h2>
+      <table>
+        <thead>
+          <tr class="header">
+            <th>رقم البلاغ</th>
+            ${showMunCol ? "<th>البلدية الفرعية</th>" : ""}
+            <th>تاريخ الإنشاء</th>
+            <th>حد أقصى</th>
+            <th>الزمن المعياري</th>
+            <th>اسم الموظف</th>
+            <th>المسندة إلى</th>
+            <th>الحالة الزمنية</th>
+            ${hasNotice ? "<th>التنويه</th>" : ""}
+          </tr>
+        </thead>
+        <tbody>
+    `;
+
+    groups[حالة].forEach(r=>{
+      let rem = getRemainingHours(r);
+      let std = getStandardHours(r);
+
+      html += `
+        <tr>
+          <td>${r["رقم البلاغ"] || ""}</td>
+          ${showMunCol ? `<td>${getMun(r)}</td>` : ""}
+          <td>${getDate(r)}</td>
+          <td>${getMaxDate(r)}</td>
+          <td>${std}</td>
+          <td>${r["اسم الموظف المسند اليه"] || ""}</td>
+          <td>${r["المسندة الى"] || ""}</td>
+          <td class="${rem !== null && rem < 0 ? 'late' : ''}">
+            ${formatTime(rem)}
+          </td>
+          ${hasNotice ? `<td class="late">${getNoticeText(r)}</td>` : ""}
+        </tr>
+      `;
+    });
+
+    html += "</tbody></table>";
+
+    div.innerHTML = html;
+    container.appendChild(div);
+  }
+}
+
+setInterval(()=>{ if(printMun === null) render(); }, 60000);
+
+loadSaved();
+
+</script>
+
+</body>
+</html>
